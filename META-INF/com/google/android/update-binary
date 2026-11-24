@@ -1,0 +1,152 @@
+#!/sbin/sh
+# TWRP flashable: boot.img + vendor firmware swap for Lumia 950 (talkman)
+# Zip layout:
+#   boot.img
+#   vendor_firmware/   (venus*, widevine*, adsp* files -> /vendor/firmware)
+
+OUTFD=/proc/self/fd/$2
+ZIP="$3"
+TMP=/tmp/lumia_flash
+
+ui_print() { echo -e "ui_print $1\nui_print" > "$OUTFD"; }
+abort() { ui_print "ERROR: $1"; ui_print "Aborting."; exit 1; }
+
+ui_print "================================"
+ui_print " Lumia 950 boot + firmware flash"
+ui_print "================================"
+
+# ---- device check: Lumia 950 (talkman) only, not 950 XL (cityman) ----
+ui_print "Checking device..."
+DEV=""
+for prop in ro.product.device ro.product.vendor.device ro.product.system.device \
+            ro.build.product ro.lineage.device ro.twrp.device ro.product.board; do
+  v="$(getprop $prop)"
+  [ -n "$v" ] && DEV="$DEV $v"
+done
+ui_print "Reported names:$DEV"
+
+# 1) must be a Lumia: TWRP builds report talkman, angler (Nexus 6P tree) or
+#    bullhead (Nexus 5X tree), so the Lumia DPP partition is what proves it
+DPP=/dev/block/platform/soc.0/f9824900.sdhci/by-name/DPP
+[ -e "$DPP" ] || [ -e /dev/block/bootdevice/by-name/DPP ] || \
+  abort "No Lumia DPP partition found. Not a Lumia 950/950 XL."
+
+# 2) must not be the 950 XL: reject cityman and the MSM8994 SoC ids
+case "$DEV" in
+  *cityman*) abort "This zip is for the Lumia 950 (talkman), not the 950 XL." ;;
+esac
+SOC="$(cat /sys/devices/soc0/soc_id 2>/dev/null)"
+ui_print "SoC id: ${SOC:-unknown}"
+case "$SOC" in
+  207|253) abort "MSM8994 detected (Lumia 950 XL). This zip is for the 950 (MSM8992)." ;;
+esac
+case "$DEV" in
+  *talkman*|*angler*|*bullhead*) ui_print "Device OK: Lumia 950 (talkman)" ;;
+  *) abort "Unknown device name:$DEV" ;;
+esac
+
+# ---- extract zip ----
+rm -rf "$TMP"; mkdir -p "$TMP"
+unzip -o "$ZIP" -d "$TMP" >/dev/null 2>&1 || abort "cannot extract zip"
+[ -f "$TMP/boot.img" ] || abort "boot.img missing in zip"
+[ -d "$TMP/vendor_firmware" ] || abort "vendor_firmware/ missing in zip"
+ls "$TMP"/vendor_firmware/* >/dev/null 2>&1 || abort "vendor_firmware/ is empty"
+
+# ---- mount partitions ----
+ui_print "Mounting /system and /vendor..."
+is_mounted() { grep -q " $1 " /proc/mounts; }
+for p in /system /system_root /vendor; do
+  is_mounted "$p" || mount "$p" 2>/dev/null
+done
+is_mounted /vendor || abort "cannot mount /vendor"
+
+# system-as-root layouts have /system/system
+if [ -d /system/system/etc ]; then
+  SYS=/system/system
+elif [ -d /system_root/system/etc ]; then
+  SYS=/system_root/system
+elif [ -d /system/etc ]; then
+  SYS=/system
+else
+  abort "cannot find system partition contents"
+fi
+ui_print "System root: $SYS"
+
+# remount rw (ignore failure, TWRP usually mounts rw)
+mount -o rw,remount /vendor 2>/dev/null
+mount -o rw,remount "$SYS" 2>/dev/null
+
+# ---- 1. flash boot.img ----
+ui_print "Flashing boot.img..."
+SLOT="$(getprop ro.boot.slot_suffix)"
+BOOTDEV=""
+for d in /dev/block/bootdevice/by-name/boot$SLOT \
+         /dev/block/by-name/boot$SLOT \
+         /dev/block/platform/*/by-name/boot$SLOT; do
+  [ -e "$d" ] && BOOTDEV="$d" && break
+done
+[ -n "$BOOTDEV" ] || abort "boot partition not found"
+ui_print "Boot partition: $BOOTDEV"
+dd if="$TMP/boot.img" of="$BOOTDEV" bs=4096 2>/dev/null || abort "dd boot.img failed"
+sync
+SZ=$(wc -c < "$TMP/boot.img")
+if ! head -c "$SZ" "$BOOTDEV" | cmp -s - "$TMP/boot.img"; then
+  abort "boot.img verification failed"
+fi
+ui_print "boot.img OK"
+
+# ---- 2. delete old modem/mba files ----
+ui_print "Deleting mba*/modem* from $SYS/etc/firmware"
+rm -f "$SYS"/etc/firmware/mba*
+rm -f "$SYS"/etc/firmware/modem*
+ui_print "Deleting mba* from /vendor/firmware"
+rm -f /vendor/firmware/mba*
+
+# ---- 3. copy venus/widevine/adsp into /vendor/firmware ----
+ui_print "Copying firmware to /vendor/firmware..."
+mkdir -p /vendor/firmware
+for f in "$TMP"/vendor_firmware/*; do
+  n="$(basename "$f")"
+  cp -f "$f" "/vendor/firmware/$n" || abort "copy failed: $n"
+  chmod 644 "/vendor/firmware/$n"
+  chown 0:0 "/vendor/firmware/$n" 2>/dev/null
+  # copy SELinux label from the directory's usual type (best effort)
+  chcon u:object_r:vendor_file:s0 "/vendor/firmware/$n" 2>/dev/null
+  cmp -s "$f" "/vendor/firmware/$n" || abort "verify failed: $n"
+  ui_print "  $n"
+done
+sync
+
+# ---- 4. model name: Lumia 950 XL -> Lumia 950 ----
+ui_print "Setting model name to Lumia 950..."
+for p in /product /system_ext /odm; do
+  is_mounted "$p" || mount "$p" 2>/dev/null
+  mount -o rw,remount "$p" 2>/dev/null
+done
+CHANGED=0
+for f in "$SYS/build.prop" /vendor/build.prop \
+         /vendor/odm/etc/build.prop /odm/etc/build.prop \
+         /product/etc/build.prop "$SYS/product/etc/build.prop" \
+         /system_ext/etc/build.prop "$SYS/system_ext/etc/build.prop"; do
+  [ -f "$f" ] || continue
+  if grep -qE '^ro\.product\..*Lumia 950 XL' "$f"; then
+    sed '/^ro\.product\./s/Lumia 950 XL/Lumia 950/g' "$f" > "$TMP/bp.new" \
+      || abort "sed failed on $f"
+    # cat > keeps the original file's inode, owner and SELinux label
+    cat "$TMP/bp.new" > "$f" || abort "write failed on $f"
+    ui_print "  patched $f"
+    CHANGED=1
+  fi
+done
+[ "$CHANGED" = 1 ] || ui_print "  nothing to change (model already set)"
+sync
+
+# ---- cleanup ----
+rm -rf "$TMP"
+umount /vendor 2>/dev/null
+umount "$SYS" 2>/dev/null
+umount /system_root 2>/dev/null
+umount /product /system_ext /odm 2>/dev/null
+
+ui_print "Done. Reboot system."
+exit 0

@@ -1,0 +1,60 @@
+name: Build TWRP zip
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      vendor_ref:
+        description: "Branch, tag or commit of android_vendor_msft_talkman"
+        default: "46f96c134d515acf66a883626eab5a0fe234dbfa"
+
+permissions:
+  contents: write
+
+env:
+  VENDOR_REPO: spacekomet/android_vendor_msft_talkman
+  VENDOR_REF: ${{ inputs.vendor_ref || '46f96c134d515acf66a883626eab5a0fe234dbfa' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true          # only needed if boot.img is stored with Git LFS
+
+      # fetch only the firmware folder, not the whole 180 MB vendor tree
+      - name: Fetch firmware from vendor repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.VENDOR_REPO }}
+          ref: ${{ env.VENDOR_REF }}
+          path: android_vendor_msft_talkman
+          sparse-checkout: proprietary/vendor/firmware
+          # token: ${{ secrets.VENDOR_TOKEN }}   # needed only if the repo is private
+
+      - name: Build zip
+        run: |
+          sh -n META-INF/com/google/android/update-binary
+          FW_SRC="$PWD/android_vendor_msft_talkman" sh ./build.sh
+          NAME="lumia950-flash-${GITHUB_SHA::7}.zip"
+          mv ../lumia-flash.zip "$NAME"
+          sha256sum "$NAME" | tee "$NAME.sha256"
+          echo "ZIP=$NAME" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumia950-flash
+          path: |
+            lumia950-flash-*.zip
+            lumia950-flash-*.zip.sha256
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" \
+            --title "$GITHUB_REF_NAME" --notes "TWRP zip for Lumia 950 (talkman), firmware from ${VENDOR_REF::7}"

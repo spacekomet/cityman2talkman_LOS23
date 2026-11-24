@@ -1,0 +1,5 @@
+# the script runs inside TWRP: it must keep Unix (LF) line endings
+*.sh text eol=lf
+update-binary text eol=lf
+updater-script text eol=lf
+*.img binary
