@@ -9,11 +9,16 @@ on:
       vendor_ref:
         description: "Branch, tag or commit of android_vendor_msft_talkman"
         default: "46f96c134d515acf66a883626eab5a0fe234dbfa"
+      kernel_tag:
+        description: "Kernel release tag (empty = latest release)"
+        default: ""
 
 permissions:
   contents: write
 
 env:
+  KERNEL_REPO: spacekomet/android_kernel_mmo_msm8994
+  KERNEL_TAG: ${{ inputs.kernel_tag }}
   VENDOR_REPO: spacekomet/android_vendor_msft_talkman
   VENDOR_REF: ${{ inputs.vendor_ref || '46f96c134d515acf66a883626eab5a0fe234dbfa' }}
 
@@ -34,6 +39,32 @@ jobs:
           path: android_vendor_msft_talkman
           sparse-checkout: proprietary/vendor/firmware
           # token: ${{ secrets.VENDOR_TOKEN }}   # needed only if the repo is private
+
+      - name: Download kernel from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p kernel
+          gh release download $KERNEL_TAG -R "$KERNEL_REPO" \
+            -p Image.gz-dtb -p SHA256SUMS -D kernel
+          (cd kernel && grep ' Image.gz-dtb$' SHA256SUMS | sha256sum -c -)
+
+      # base/boot.img = your current working boot.img (ramdisk, cmdline, header);
+      # only its kernel (Image.gz-dtb with both dtbs) is replaced
+      - name: Repack boot.img with new kernel
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq abootimg
+          BASE=base/boot.img; [ -f "$BASE" ] || BASE=boot.img
+          [ -f "$BASE" ] || { echo "no base boot.img (base/boot.img)"; exit 1; }
+          cp "$BASE" new-boot.img
+          abootimg -i new-boot.img
+          abootimg -u new-boot.img -k kernel/Image.gz-dtb
+          [ "$(wc -c < new-boot.img)" = "$(wc -c < "$BASE")" ] || \
+            { echo "image size changed: kernel too big for the original boot.img size"; exit 1; }
+          abootimg -x new-boot.img /tmp/b.cfg /tmp/k.out /tmp/r.out
+          cmp /tmp/k.out kernel/Image.gz-dtb
+          mv new-boot.img boot.img
+          abootimg -i boot.img | grep -E 'size|cmdline'
 
       - name: Build zip
         run: |
